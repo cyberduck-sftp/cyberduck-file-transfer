@@ -1,0 +1,894 @@
+package ch.cyberduck.ui.cocoa.controller;
+
+/*
+ * Copyright (c) 2002-2016 iterate GmbH. All rights reserved.
+ * https://cyberduck.io/
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
+
+import ch.cyberduck.binding.AbstractTableDelegate;
+import ch.cyberduck.binding.Action;
+import ch.cyberduck.binding.Delegate;
+import ch.cyberduck.binding.HyperlinkAttributedStringFactory;
+import ch.cyberduck.binding.Outlet;
+import ch.cyberduck.binding.WindowController;
+import ch.cyberduck.binding.application.*;
+import ch.cyberduck.binding.foundation.NSArray;
+import ch.cyberduck.binding.foundation.NSIndexSet;
+import ch.cyberduck.binding.foundation.NSNotification;
+import ch.cyberduck.binding.foundation.NSNotificationCenter;
+import ch.cyberduck.binding.foundation.NSRange;
+import ch.cyberduck.core.AbstractCollectionListener;
+import ch.cyberduck.core.Collection;
+import ch.cyberduck.core.CollectionListener;
+import ch.cyberduck.core.Host;
+import ch.cyberduck.core.LocalFactory;
+import ch.cyberduck.core.LocaleFactory;
+import ch.cyberduck.core.Path;
+import ch.cyberduck.core.SessionPoolFactory;
+import ch.cyberduck.core.TranscriptListener;
+import ch.cyberduck.core.TransferCollection;
+import ch.cyberduck.core.exception.AccessDeniedException;
+import ch.cyberduck.core.exception.BackgroundException;
+import ch.cyberduck.core.io.BandwidthThrottle;
+import ch.cyberduck.core.local.ApplicationLauncherFactory;
+import ch.cyberduck.core.local.LocalTrashFactory;
+import ch.cyberduck.core.local.RevealService;
+import ch.cyberduck.core.local.RevealServiceFactory;
+import ch.cyberduck.core.logging.UnifiedSystemLogTranscriptListener;
+import ch.cyberduck.core.pasteboard.PathPasteboard;
+import ch.cyberduck.core.pasteboard.PathPasteboardFactory;
+import ch.cyberduck.core.pool.SessionPool;
+import ch.cyberduck.core.preferences.Preferences;
+import ch.cyberduck.core.preferences.PreferencesFactory;
+import ch.cyberduck.core.resources.IconCacheFactory;
+import ch.cyberduck.core.threading.BackgroundAction;
+import ch.cyberduck.core.threading.ControllerMainAction;
+import ch.cyberduck.core.threading.DefaultMainAction;
+import ch.cyberduck.core.threading.TransferBackgroundAction;
+import ch.cyberduck.core.threading.TransferCollectionBackgroundAction;
+import ch.cyberduck.core.threading.WindowMainAction;
+import ch.cyberduck.core.transfer.DownloadTransfer;
+import ch.cyberduck.core.transfer.Transfer;
+import ch.cyberduck.core.transfer.TransferCallback;
+import ch.cyberduck.core.transfer.TransferItem;
+import ch.cyberduck.core.transfer.TransferListener;
+import ch.cyberduck.core.transfer.TransferOptions;
+import ch.cyberduck.core.transfer.TransferProgress;
+import ch.cyberduck.core.transfer.TransferQueue;
+import ch.cyberduck.core.transfer.TransferQueueFactory;
+import ch.cyberduck.core.transfer.TransferSpeedometer;
+import ch.cyberduck.ui.browser.DownloadDirectoryFinder;
+import ch.cyberduck.ui.cocoa.datasource.TransferTableDataSource;
+import ch.cyberduck.ui.cocoa.delegate.AbstractMenuDelegate;
+import ch.cyberduck.ui.cocoa.toolbar.TransferToolbarFactory;
+import ch.cyberduck.ui.cocoa.toolbar.TransferToolbarValidator;
+
+import org.apache.commons.lang3.StringUtils;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.rococoa.Foundation;
+import org.rococoa.ID;
+import org.rococoa.Rococoa;
+import org.rococoa.Selector;
+import org.rococoa.cocoa.CGFloat;
+import org.rococoa.cocoa.foundation.NSInteger;
+import org.rococoa.cocoa.foundation.NSSize;
+import org.rococoa.cocoa.foundation.NSUInteger;
+
+import java.text.MessageFormat;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.StringTokenizer;
+
+public class TransferController extends WindowController implements TransferListener, CollectionListener<Transfer>, NSToolbar.Delegate, NSMenu.Validation {
+    private static final Logger log = LogManager.getLogger(TransferController.class);
+
+    private final TransferToolbarValidator toolbarValidator = new TransferToolbarValidator(this);
+
+    private final TransferToolbarFactory toolbarFactory
+        = new TransferToolbarFactory(this);
+
+    private final NSNotificationCenter notificationCenter
+        = NSNotificationCenter.defaultCenter();
+
+    private final Preferences preferences
+        = PreferencesFactory.get();
+
+    private final TransferCollection collection = TransferCollection.defaultCollection();
+    private final TableColumnFactory tableColumnsFactory = new TableColumnFactory();
+    private final BandwidthMenuDelegate bandwidthMenuDelegate = new BandwidthMenuDelegate();
+    private final TranscriptListener transcript = new UnifiedSystemLogTranscriptListener();
+
+    @Outlet
+    private NSProgressIndicator transferSpinner;
+    @Outlet
+    private NSToolbar toolbar;
+    @Outlet
+    private NSTextField urlField;
+    @Outlet
+    private NSTextField localField;
+    @Outlet
+    private NSTextField localLabel;
+    @Outlet
+    private NSImageView iconView;
+    @Outlet
+    private NSTextField filterField;
+    @Outlet
+    private NSTableView transferTable;
+    @Delegate
+    private TransferTableDataSource transferTableModel;
+    @Delegate
+    private AbstractTableDelegate<Transfer, TransferColumn> transferTableDelegate;
+
+    @Override
+    public void collectionLoaded() {
+        this.invoke(new ControllerMainAction(TransferController.this) {
+            @Override
+            public void run() {
+                reload();
+            }
+        });
+    }
+
+    @Override
+    public void collectionItemAdded(final Transfer item) {
+        this.invoke(new ControllerMainAction(TransferController.this) {
+            @Override
+            public void run() {
+                reload();
+            }
+        });
+    }
+
+    @Override
+    public void collectionItemRemoved(final Transfer item) {
+        this.invoke(new ControllerMainAction(TransferController.this) {
+            @Override
+            public void run() {
+                reload();
+            }
+        });
+    }
+
+    @Override
+    public void collectionItemChanged(final Transfer item) {
+        this.invoke(new ControllerMainAction(TransferController.this) {
+            @Override
+            public void run() {
+                reload();
+            }
+        });
+    }
+
+    public TransferController() {
+        collection.addListener(this);
+    }
+
+    @Override
+    public void awakeFromNib() {
+        this.toolbar = NSToolbar.toolbarWithIdentifier("Transfer Toolbar");
+        this.toolbar.setDelegate(this.id());
+        this.toolbar.setAllowsUserCustomization(true);
+        this.toolbar.setAutosavesConfiguration(true);
+        this.toolbar.setDisplayMode(NSToolbar.NSToolbarDisplayModeIconOnly);
+        this.window.setToolbar(toolbar);
+
+        if(!collection.isLoaded()) {
+            transferSpinner.startAnimation(null);
+            collection.addListener(new AbstractCollectionListener<Transfer>() {
+                @Override
+                public void collectionLoaded() {
+                    invoke(new WindowMainAction(TransferController.this) {
+                        @Override
+                        public void run() {
+                            transferSpinner.stopAnimation(null);
+                            transferTable.setGridStyleMask(NSTableView.NSTableViewSolidHorizontalGridLineMask);
+                        }
+                    });
+                    collection.removeListener(this);
+                }
+            });
+        }
+        else {
+            transferSpinner.stopAnimation(null);
+            transferTable.setGridStyleMask(NSTableView.NSTableViewSolidHorizontalGridLineMask);
+        }
+        super.awakeFromNib();
+    }
+
+    @Override
+    public void setWindow(final NSWindow window) {
+        window.setContentMinSize(new NSSize(400d, 150d));
+        window.setMovableByWindowBackground(true);
+        window.setTitle(LocaleFactory.localizedString("Transfers"));
+        if(window.respondsToSelector(Foundation.selector("setTabbingIdentifier:"))) {
+            window.setTabbingIdentifier(preferences.getProperty("queue.window.tabbing.identifier"));
+        }
+        super.setWindow(window);
+    }
+
+    /**
+     * Keep controller when window is closed to continue receiving progress from running transfers
+     */
+    @Override
+    protected boolean isReleasedWhenClosed() {
+        return false;
+    }
+
+    @Override
+    public String windowFrameName() {
+        return "Transfers";
+    }
+
+    @Outlet
+    public void setUrlField(NSTextField urlField) {
+        this.urlField = urlField;
+        this.urlField.setSelectable(false);
+    }
+
+    @Outlet
+    public void setLocalField(NSTextField localField) {
+        this.localField = localField;
+        this.localField.setSelectable(true);
+    }
+
+    @Outlet
+    public void setLocalLabel(NSTextField localLabel) {
+        this.localLabel = localLabel;
+        this.localLabel.setStringValue(LocaleFactory.localizedString("Local File:", "Transfer"));
+    }
+
+    @Outlet
+    public void setIconView(final NSImageView iconView) {
+        this.iconView = iconView;
+    }
+
+    @Action
+    public void connectionsPopupChanged(final NSMenuItem sender) {
+        if(null == sender.representedObject()) {
+            return;
+        }
+        final int connections = Integer.parseInt(sender.representedObject());
+        preferences.setProperty("queue.connections.limit", connections);
+        final TransferQueue queue = TransferQueueFactory.get();
+        queue.resize(connections);
+    }
+
+    public NSTextField getFilterField() {
+        return filterField;
+    }
+
+    @Outlet
+    public void setFilterField(final NSTextField t) {
+        this.filterField = t;
+        notificationCenter.addObserver(this.id(),
+            Foundation.selector("filterFieldTextDidChange:"),
+            NSControl.NSControlTextDidChangeNotification,
+            t.id());
+    }
+
+    @Delegate
+    public void filterFieldTextDidChange(final NSNotification notification) {
+        transferTableModel.setFilter(filterField.stringValue());
+        this.reload();
+    }
+
+    @Outlet
+    public void setTransferSpinner(NSProgressIndicator transferSpinner) {
+        this.transferSpinner = transferSpinner;
+    }
+
+    /**
+     * Change focus to filter field
+     *
+     * @param sender Search field
+     */
+    @Action
+    public void searchButtonClicked(final ID sender) {
+        window.makeFirstResponder(filterField);
+    }
+
+    @Action
+    public void bandwidthPopupChanged(NSMenuItem sender) {
+        if(null == sender.representedObject()) {
+            return;
+        }
+        final NSIndexSet selected = transferTable.selectedRowIndexes();
+        final float bandwidth = Float.parseFloat(sender.representedObject());
+        for(NSUInteger index = selected.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = selected.indexGreaterThanIndex(index)) {
+            final Transfer transfer = collection.get(index.intValue());
+            transfer.setBandwidth(bandwidth);
+            if(transfer.isRunning()) {
+                // Find matching background task
+                for(BackgroundAction<?> action : registry.toArray(new BackgroundAction[registry.size()])) {
+                    if(action instanceof TransferBackgroundAction) {
+                        final TransferBackgroundAction t = (TransferBackgroundAction) action;
+                        if(t.getTransfer().equals(transfer)) {
+                            final TransferSpeedometer meter = t.getMeter();
+                            meter.reset();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Override
+    protected String getBundleName() {
+        return "Transfer";
+    }
+
+    @Override
+    public void invalidate() {
+        toolbar.setDelegate(null);
+        collection.removeListener(this);
+        transferTableModel.invalidate();
+        super.invalidate();
+    }
+
+    @Outlet
+    public void setQueueTable(NSTableView view) {
+        this.transferTable = view;
+        this.transferTable.setRowHeight(new CGFloat(92));
+        {
+            NSTableColumn c = tableColumnsFactory.create(TransferColumn.progress.name());
+            c.setMinWidth(80f);
+            c.setWidth(300f);
+            c.setResizingMask(NSTableColumn.NSTableColumnAutoresizingMask);
+            this.transferTable.addTableColumn(c);
+        }
+        this.transferTable.setDataSource((transferTableModel = new TransferTableDataSource()).id());
+        this.transferTable.setDelegate((transferTableDelegate = new AbstractTableDelegate<Transfer, TransferColumn>(
+            transferTable.tableColumnWithIdentifier(TransferColumn.progress.name())
+        ) {
+            @Override
+            public String tooltip(final Transfer t, final TransferColumn column) {
+                return t.getName();
+            }
+
+            @Override
+            public void enterKeyPressed(final ID sender) {
+                this.tableRowDoubleClicked(sender);
+            }
+
+            @Override
+            public void deleteKeyPressed(final ID sender) {
+                deleteButtonClicked(sender);
+            }
+
+            @Override
+            public void tableColumnClicked(NSTableView view, NSTableColumn tableColumn) {
+                //
+            }
+
+            @Override
+            public void tableRowDoubleClicked(final ID sender) {
+                reloadButtonClicked(sender);
+            }
+
+            @Override
+            public void selectionDidChange(final NSNotification notification) {
+                updateSelection();
+                transferTable.noteHeightOfRowsWithIndexesChanged(
+                    NSIndexSet.indexSetWithIndexesInRange(
+                        NSRange.NSMakeRange(new NSUInteger(0), new NSUInteger(transferTable.numberOfRows()))));
+            }
+
+            @Delegate
+            public NSView tableView_viewForTableColumn_row(final NSTableView view, final NSTableColumn column, final NSInteger row) {
+                final ProgressController controller = transferTableModel.getController(row.intValue());
+                return controller.view();
+            }
+
+            @Override
+            public boolean isTypeSelectSupported() {
+                return true;
+            }
+
+            public String tableView_typeSelectStringForTableColumn_row(final NSTableView view, final NSTableColumn column, final NSInteger row) {
+                return transferTableModel.getSource().get(row.intValue()).getName();
+            }
+        }).id());
+        this.transferTable.setTarget(transferTableDelegate.id());
+        this.transferTable.setDoubleAction(Foundation.selector("tableRowDoubleClicked:"));
+        // receive drag events from types
+        // in fact we are not interested in file promises, but because the browser model can only initiate
+        // a drag with tableView.dragPromisedFilesOfTypes(), we listens for those events
+        // and then use the private pasteboard instead.
+        this.transferTable.registerForDraggedTypes(NSArray.arrayWithObjects(
+            NSPasteboard.StringPboardType,
+            // Accept file promises made myself
+            NSPasteboard.FilesPromisePboardType));
+        // No grid lines until list is loaded
+        this.transferTable.setGridStyleMask(NSTableView.NSTableViewGridNone);
+        // Set sselection properties
+        this.transferTable.setAllowsMultipleSelection(true);
+        this.transferTable.setAllowsEmptySelection(true);
+        this.transferTable.setAllowsColumnReordering(false);
+        this.transferTable.sizeToFit();
+    }
+
+    public NSTableView getTransferTable() {
+        return transferTable;
+    }
+
+    public TransferTableDataSource getTransferTableModel() {
+        return transferTableModel;
+    }
+
+    /**
+     * Update labels from selection
+     */
+    private void updateSelection() {
+        this.updateLabels();
+        this.updateIcon();
+        toolbar.validateVisibleItems();
+    }
+
+    private void updateLabels() {
+        final int selected = transferTable.numberOfSelectedRows().intValue();
+        if(1 == selected) {
+            final Transfer transfer = transferTableModel.getSource().get(transferTable.selectedRow().intValue());
+            // Draw text fields at the bottom
+            final String remote = transfer.getRemote().getUrl();
+            urlField.setStringValue(remote);
+            final String local = transfer.getLocal();
+            if(local != null) {
+                localField.setAttributedStringValue(
+                    HyperlinkAttributedStringFactory.create(local, LocalFactory.get(local)));
+            }
+            else {
+                localField.setStringValue(StringUtils.EMPTY);
+            }
+        }
+        else {
+            urlField.setStringValue(StringUtils.EMPTY);
+            localField.setStringValue(StringUtils.EMPTY);
+        }
+    }
+
+    private void updateIcon() {
+        final int selected = transferTable.numberOfSelectedRows().intValue();
+        if(1 == selected) {
+            final Transfer transfer = transferTableModel.getSource().get(transferTable.selectedRow().intValue());
+            // Draw file type icon
+            if(transfer.getRoots().size() == 1) {
+                if(transfer.getLocal() != null) {
+                    iconView.setImage(IconCacheFactory.<NSImage>get().fileIcon(transfer.getRoot().local, 32));
+                }
+                else {
+                    iconView.setImage(IconCacheFactory.<NSImage>get().fileIcon(transfer.getRoot().remote, 32));
+                }
+            }
+            else {
+                iconView.setImage(IconCacheFactory.<NSImage>get().iconNamed("NSMultipleDocuments", 32));
+            }
+        }
+        else {
+            iconView.setImage(null);
+        }
+    }
+
+    private void reload() {
+        while(transferTable.subviews().count().intValue() > 0) {
+            (Rococoa.cast(transferTable.subviews().lastObject(), NSView.class)).removeFromSuperviewWithoutNeedingDisplay();
+        }
+        transferTable.reloadData();
+        this.updateSelection();
+    }
+
+    /**
+     * Add this item to the list; select it and scroll the view to make it visible
+     *
+     * @param transfer Transfer
+     */
+    public void add(final Transfer transfer, final TransferBackgroundAction action) {
+        if(collection.size() > preferences.getInteger("queue.size.warn")) {
+            final NSAlert alert = NSAlert.alert(
+                TransferToolbarFactory.TransferToolbarItem.cleanup.label(), //title
+                LocaleFactory.localizedString("Remove completed transfers from list."), // message
+                TransferToolbarFactory.TransferToolbarItem.cleanup.label(), // defaultbutton
+                LocaleFactory.localizedString("Cancel"), // alternate button
+                null //other button
+            );
+            alert.setShowsSuppressionButton(true);
+            alert.suppressionButton().setTitle(LocaleFactory.localizedString("Don't ask again", "Configuration"));
+            this.alert(alert, new SheetCallback() {
+                @Override
+                public void callback(int returncode) {
+                    if(alert.suppressionButton().state() == NSCell.NSOnState) {
+                        // Never show again.
+                        preferences.setProperty("queue.size.warn", Integer.MAX_VALUE);
+                    }
+                    if(returncode == DEFAULT_OPTION) {
+                        clearButtonClicked(null);
+                    }
+                    add(transfer);
+                    background(action);
+                }
+            });
+        }
+        else {
+            this.add(transfer);
+            this.background(action);
+        }
+    }
+
+    private void add(final Transfer transfer) {
+        collection.add(transfer);
+        final int row = collection.size() - 1;
+        final NSInteger index = new NSInteger(row);
+        transferTable.selectRowIndexes(NSIndexSet.indexSetWithIndex(index), false);
+        transferTable.scrollRowToVisible(index);
+    }
+
+    public void transferDidStart(final Transfer transfer) {
+        final ProgressController progress = transferTableModel.getController(transfer);
+        progress.transferDidStart(transfer);
+        this.invoke(new DefaultMainAction() {
+            @Override
+            public void run() {
+                toolbar.validateVisibleItems();
+            }
+        });
+    }
+
+    @Override
+    public void transferDidStop(final Transfer transfer) {
+        final ProgressController progress = transferTableModel.getController(transfer);
+        progress.transferDidStop(transfer);
+        this.invoke(new DefaultMainAction() {
+            @Override
+            public void run() {
+                toolbar.validateVisibleItems();
+            }
+        });
+    }
+
+    @Override
+    public void transferDidProgress(final Transfer transfer, final TransferProgress status) {
+        final ProgressController progress = transferTableModel.getController(transfer);
+        progress.transferDidProgress(transfer, status);
+    }
+
+    public void start(final Transfer transfer, final TransferOptions options) {
+        this.start(transfer, options, new TransferCallback() {
+            @Override
+            public void complete(final Transfer transfer) {
+                //
+            }
+        });
+    }
+
+    public void start(final Transfer transfer, final TransferOptions options, final TransferCallback callback) {
+        final ProgressController progress = transferTableModel.getController(transfer);
+        final Host source = transfer.getSource();
+        final Host destination = transfer.getDestination();
+        final TransferBackgroundAction action = new TransferCollectionBackgroundAction(this,
+            null == source ? SessionPool.DISCONNECTED : SessionPoolFactory.create(this, source, progress),
+            null == destination ? SessionPool.DISCONNECTED : SessionPoolFactory.create(this, destination, progress),
+            this, progress, transfer, options) {
+            @Override
+            public void init() throws BackgroundException {
+                super.init();
+                if(preferences.getBoolean("queue.window.open.transfer.start")) {
+                    display();
+                }
+            }
+
+            @Override
+            public void finish() {
+                super.finish();
+                if(transfer.isComplete()) {
+                    callback.complete(transfer);
+                }
+            }
+
+            @Override
+            public void cleanup() {
+                super.cleanup();
+                if(transfer.isReset() && transfer.isComplete()) {
+                    if(preferences.getBoolean("queue.window.open.transfer.stop")) {
+                        if(!(collection.numberOfRunningTransfers() > 0)) {
+                            close();
+                        }
+                    }
+                }
+            }
+        };
+        if(!collection.contains(transfer)) {
+            this.add(transfer, action);
+        }
+        else {
+            this.background(action);
+        }
+    }
+
+    @Override
+    public void log(final Type type, final String message) {
+        transcript.log(type, message);
+    }
+
+    @Override
+    public NSToolbarItem toolbar_itemForItemIdentifier_willBeInsertedIntoToolbar(final NSToolbar toolbar, final String identifier, final boolean flag) {
+        return toolbarFactory.create(identifier);
+    }
+
+    @Action
+    public void paste(final ID sender) {
+        for(PathPasteboard pasteboard : PathPasteboardFactory.allPasteboards()) {
+            if(pasteboard.isEmpty()) {
+                continue;
+            }
+            log.debug("Paste download transfer from pasteboard");
+            final List<TransferItem> downloads = new ArrayList<>();
+            for(Path download : pasteboard) {
+                downloads.add(new TransferItem(download, LocalFactory.get(
+                    new DownloadDirectoryFinder().find(pasteboard.getBookmark()),
+                    download.getName())));
+            }
+            this.add(new DownloadTransfer(pasteboard.getBookmark(), downloads));
+            pasteboard.clear();
+        }
+    }
+
+    @Action
+    public void stopButtonClicked(final ID sender) {
+        final NSIndexSet selected = transferTable.selectedRowIndexes();
+        for(NSUInteger index = selected.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = selected.indexGreaterThanIndex(index)) {
+            final Transfer transfer = transferTableModel.getSource().get(index.intValue());
+            if(transfer.isRunning()) {
+                // Find matching background task
+                for(BackgroundAction<?> action : registry.toArray(new BackgroundAction[registry.size()])) {
+                    if(action instanceof TransferBackgroundAction) {
+                        final TransferBackgroundAction t = (TransferBackgroundAction) action;
+                        if(t.getTransfer().equals(transfer)) {
+                            t.cancel();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Action
+    public void stopAllButtonClicked(final ID sender) {
+        final Collection<Transfer> transfers = transferTableModel.getSource();
+        for(final Transfer transfer : transfers) {
+            if(transfer.isRunning()) {
+                // Find matching background task
+                for(BackgroundAction<?> action : registry.toArray(new BackgroundAction[registry.size()])) {
+                    if(action instanceof TransferBackgroundAction) {
+                        final TransferBackgroundAction t = (TransferBackgroundAction) action;
+                        if(t.getTransfer().equals(transfer)) {
+                            t.cancel();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Action
+    public void resumeButtonClicked(final ID sender) {
+        final NSIndexSet selected = transferTable.selectedRowIndexes();
+        for(NSUInteger index = selected.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = selected.indexGreaterThanIndex(index)) {
+            final Collection<Transfer> transfers = transferTableModel.getSource();
+            final Transfer transfer = transfers.get(index.intValue());
+            if(!transfer.isRunning()) {
+                final TransferOptions options = new TransferOptions()
+                        .resume(true)
+                        .reload(false);
+                this.start(transfer, options);
+            }
+        }
+    }
+
+    @Action
+    public void reloadButtonClicked(final ID sender) {
+        final NSIndexSet selected = transferTable.selectedRowIndexes();
+        for(NSUInteger index = selected.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = selected.indexGreaterThanIndex(index)) {
+            final Collection<Transfer> transfers = transferTableModel.getSource();
+            final Transfer transfer = transfers.get(index.intValue());
+            if(!transfer.isRunning()) {
+                final TransferOptions options = new TransferOptions()
+                        .resume(false)
+                        .reload(true);
+                this.start(transfer, options);
+            }
+        }
+    }
+
+    @Action
+    public void openButtonClicked(final ID sender) {
+        if(transferTable.numberOfSelectedRows().intValue() == 1) {
+            final Transfer transfer = transferTableModel.getSource().get(transferTable.selectedRow().intValue());
+            for(TransferItem l : transfer.getRoots()) {
+                ApplicationLauncherFactory.get().open(l.local);
+            }
+        }
+    }
+
+    @Action
+    public void revealButtonClicked(final ID sender) {
+        final NSIndexSet selected = transferTable.selectedRowIndexes();
+        final Collection<Transfer> transfers = transferTableModel.getSource();
+        final RevealService reveal = RevealServiceFactory.get();
+        for(NSUInteger index = selected.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = selected.indexGreaterThanIndex(index)) {
+            final Transfer transfer = transfers.get(index.intValue());
+            for(TransferItem l : transfer.getRoots()) {
+                reveal.reveal(l.local);
+            }
+        }
+    }
+
+    @Action
+    public void deleteButtonClicked(final ID sender) {
+        final NSIndexSet selected = transferTable.selectedRowIndexes();
+        final Collection<Transfer> transfers = transferTableModel.getSource();
+        int i = 0;
+        final List<Transfer> remove = new ArrayList<>();
+        for(NSUInteger index = selected.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = selected.indexGreaterThanIndex(index)) {
+            final Transfer t = transfers.get(index.intValue() - i);
+            if(!t.isRunning()) {
+                remove.add(t);
+            }
+        }
+        collection.removeAll(remove);
+        collection.save();
+    }
+
+    @Action
+    public void clearButtonClicked(final ID sender) {
+        collection.removeIf(Transfer::isComplete);
+        collection.save();
+    }
+
+    @Action
+    public void trashButtonClicked(final ID sender) {
+        final NSIndexSet selected = transferTable.selectedRowIndexes();
+        final Collection<Transfer> transfers = transferTableModel.getSource();
+        for(NSUInteger index = selected.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = selected.indexGreaterThanIndex(index)) {
+            final Transfer transfer = transfers.get(index.intValue());
+            if(!transfer.isRunning()) {
+                for(TransferItem l : transfer.getRoots()) {
+                    try {
+                        LocalTrashFactory.get().trash(l.local);
+                    }
+                    catch(AccessDeniedException e) {
+                        log.warn("Failure trashing file {} {}", l.local, e.getMessage());
+                    }
+                }
+            }
+        }
+        this.updateIcon();
+    }
+
+    @Action
+    public void printDocument(final ID sender) {
+        this.print(transferTable);
+    }
+
+    /**
+     * NSToolbar.Delegate
+     *
+     * @param toolbar Window toolbar
+     */
+    @Override
+    public NSArray toolbarDefaultItemIdentifiers(final NSToolbar toolbar) {
+        return toolbarFactory.getDefault();
+    }
+
+    /**
+     * NSToolbar.Delegate
+     *
+     * @param toolbar Window toolbar
+     */
+    @Override
+    public NSArray toolbarAllowedItemIdentifiers(final NSToolbar toolbar) {
+        return toolbarFactory.getAllowed();
+    }
+
+    @Override
+    public NSArray toolbarSelectableItemIdentifiers(final NSToolbar toolbar) {
+        return NSArray.array();
+    }
+
+    /**
+     * @param item Menu item
+     * @return True if enabled
+     */
+    @Override
+    public boolean validateMenuItem(final NSMenuItem item) {
+        final Selector action = item.action();
+        if(action.equals(Foundation.selector("paste:"))) {
+            final List<PathPasteboard> pasteboards = PathPasteboardFactory.allPasteboards();
+            if(pasteboards.size() == 1) {
+                for(PathPasteboard pasteboard : pasteboards) {
+                    if(pasteboard.size() == 1) {
+                        item.setTitle(MessageFormat.format(LocaleFactory.localizedString("Paste {0}"), pasteboard.get(0).getName()));
+                    }
+                    else {
+                        item.setTitle(MessageFormat.format(LocaleFactory.localizedString("Paste {0}"),
+                                MessageFormat.format(LocaleFactory.localizedString("{0} Items"), String.valueOf(pasteboard.size()))));
+                    }
+                }
+            }
+            else {
+                item.setTitle(LocaleFactory.localizedString("Paste"));
+            }
+        }
+        return toolbarValidator.validate(action);
+    }
+
+    /**
+     * @param item Toolbar item
+     */
+    @Override
+    @Action
+    public boolean validateToolbarItem(final NSToolbarItem item) {
+        return toolbarValidator.validate(item);
+    }
+
+    public AbstractMenuDelegate getBandwidthMenuDelegate() {
+        return bandwidthMenuDelegate;
+    }
+
+    private enum TransferColumn {
+        progress,
+    }
+
+    private class BandwidthMenuDelegate extends AbstractMenuDelegate {
+        @Override
+        public NSInteger numberOfItemsInMenu(final NSMenu menu) {
+            return new NSInteger(new StringTokenizer(preferences.getProperty("queue.bandwidth.options"), ",").countTokens() + 2);
+        }
+
+        @Override
+        public boolean menuUpdateItemAtIndex(final NSMenu menu, final NSMenuItem item, final NSInteger i, final boolean cancel) {
+            if(item.representedObject() != null) {
+                final int selected = transferTable.numberOfSelectedRows().intValue();
+                final int bytes = Integer.parseInt(item.representedObject());
+                final NSIndexSet iterator = transferTable.selectedRowIndexes();
+                for(NSUInteger index = iterator.firstIndex(); !index.equals(NSIndexSet.NSNotFound); index = iterator.indexGreaterThanIndex(index)) {
+                    final Transfer transfer = collection.get(index.intValue());
+                    if(BandwidthThrottle.UNLIMITED == transfer.getBandwidth().getRate()) {
+                        if(BandwidthThrottle.UNLIMITED == bytes) {
+                            item.setState(selected > 1 ? NSCell.NSMixedState : NSCell.NSOnState);
+                            break;
+                        }
+                        else {
+                            item.setState(NSCell.NSOffState);
+                        }
+                    }
+                    else {
+                        final int bandwidth = (int) transfer.getBandwidth().getRate();
+                        if(bytes == bandwidth) {
+                            item.setState(selected > 1 ? NSCell.NSMixedState : NSCell.NSOnState);
+                            break;
+                        }
+                        else {
+                            item.setState(NSCell.NSOffState);
+                        }
+                    }
+                }
+            }
+            return super.menuUpdateItemAtIndex(menu, item, i, cancel);
+        }
+
+        @Override
+        public Selector getDefaultAction() {
+            return Foundation.selector("bandwidthPopupChanged:");
+        }
+    }
+}
